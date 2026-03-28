@@ -1,0 +1,1413 @@
+package com.voicechat;
+
+import android.Manifest;
+import android.annotation.SuppressLint;
+import android.content.ContentResolver;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.media.MediaPlayer;
+import android.media.MediaRecorder;
+import android.net.ConnectivityManager;
+import android.net.NetworkInfo;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.MediaStore;
+import android.speech.RecognitionListener;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
+import android.util.Log;
+import android.view.Gravity;
+import android.view.View;
+import android.widget.Button;
+import android.widget.ImageButton;
+import android.widget.ImageView;
+import android.widget.LinearLayout;
+import android.widget.ProgressBar;
+import android.widget.ScrollView;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.AlertDialog;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+import androidx.core.content.FileProvider;
+
+import com.google.gson.Gson;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.URLConnection;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.HttpUrl;
+import okhttp3.MediaType;
+import okhttp3.MultipartBody;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+
+public class MainActivity extends AppCompatActivity {
+
+    private static final String TAG = "VoiceChat";
+    private static final String PREFS_NAME = "voicechat_prefs";
+    private static final String KEY_SESSION_ID = "session_id";
+    private static final String KEY_USE_VOSK = "use_vosk";
+    private static final String KEY_SERVER_URL = "server_url";
+    private static final String KEY_AUTO_PLAY_AUDIO = "auto_play_audio";
+    private static final String DEFAULT_SERVER_URL = "http://123.58.210.65:18881";
+    private static final int REQ_RECORD_AUDIO = 100;
+    private static final int MAX_RECORD_SECONDS = 10;
+    private static final int REQ_PERMISSIONS_MEDIA = 101;
+    private static final int REQ_PERMISSIONS_CAMERA = 102;
+
+    // UI
+    private Button btnSpeak;
+    private Button btnMode;
+    private Button btnSettings;
+    private LinearLayout llChat;
+    private ScrollView scrollView;
+    private TextView tvStatus;
+    private TextView tvSessionId;
+    private TextView tvEngine;
+    private ImageButton btnAttach;
+    private ImageButton btnCamera;
+
+    // Recording
+    private MediaRecorder mediaRecorder;
+    private SpeechRecognizer speechRecognizer;
+    private OkHttpClient httpClient;
+    private Gson gson;
+    private Handler mainHandler;
+
+    private SharedPreferences prefs;
+    private String sessionId;
+    private String serverUrl;
+
+    private boolean isRecording = false;
+    private boolean isRecognizing = false;
+    private boolean useVosk = true;
+    private boolean autoPlayAudio = true;
+    private String currentAudioFile;
+
+    private Runnable recordTimeoutRunnable;
+
+    // Vosk
+    private VoskManager voskManager;
+    private WavAudioRecorder wavRecorder;
+    private String currentWavFile;
+
+    // Media picker
+    private Uri pendingCameraUri;
+    private boolean pendingUploadIsAudio = false;
+    private boolean pendingUploadIsFile = false;
+
+    // Media player for TTS
+    private MediaPlayer mediaPlayer;
+    private String currentlyPlayingAudioId;
+
+    // Activity result launchers
+    private ActivityResultLauncher<Intent> galleryLauncher;
+    private ActivityResultLauncher<Intent> cameraLauncher;
+
+    // ==================== 初始化 ====================
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        initLaunchers();
+        initViews();
+        initClients();
+        loadSessionId();
+        loadSettings();
+        setupListeners();
+        initVosk();
+    }
+
+    private void initLaunchers() {
+        galleryLauncher = registerForActivityResult(
+                new ActivityResultContracts.StartActivityForResult(),
+                result -> {
+                    if (result.getResultCode() == RESULT_OK && result.getData() != null) {
+                        handleGalleryResult(result.getData());
+                    }
+                }
+        );
+
+        cameraLauncher = registerForActivityResult(
+                new ActivityResultContracts.StartActivityForResult(),
+                result -> {
+                    if (result.getResultCode() == RESULT_OK && pendingCameraUri != null) {
+                        uploadAndSendMedia(pendingCameraUri, "image", false, false);
+                    }
+                }
+        );
+    }
+
+    private void initViews() {
+        btnSpeak = findViewById(R.id.btnSpeak);
+        llChat = findViewById(R.id.llChat);
+        scrollView = findViewById(R.id.scrollView);
+        tvStatus = findViewById(R.id.tvStatus);
+        tvSessionId = findViewById(R.id.tvSessionId);
+        btnMode = findViewById(R.id.btnMode);
+        tvEngine = findViewById(R.id.tvEngine);
+        btnSettings = findViewById(R.id.btnSettings);
+        btnAttach = findViewById(R.id.btnAttach);
+        btnCamera = findViewById(R.id.btnCamera);
+
+        updateSessionIdDisplay();
+        updateEngineDisplay();
+    }
+
+    private void initClients() {
+        httpClient = new OkHttpClient.Builder()
+                .connectTimeout(30, TimeUnit.SECONDS)
+                .readTimeout(60, TimeUnit.SECONDS)
+                .writeTimeout(30, TimeUnit.SECONDS)
+                .build();
+        gson = new Gson();
+        mainHandler = new Handler(Looper.getMainLooper());
+    }
+
+    private void loadSessionId() {
+        prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        sessionId = prefs.getString(KEY_SESSION_ID, null);
+        if (sessionId == null) {
+            sessionId = UUID.randomUUID().toString();
+            prefs.edit().putString(KEY_SESSION_ID, sessionId).apply();
+        }
+        useVosk = prefs.getBoolean(KEY_USE_VOSK, true);
+    }
+
+    private void loadSettings() {
+        serverUrl = prefs.getString(KEY_SERVER_URL, DEFAULT_SERVER_URL);
+        autoPlayAudio = prefs.getBoolean(KEY_AUTO_PLAY_AUDIO, true);
+    }
+
+    private String getServerUrl() {
+        if (prefs == null) {
+            prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        }
+        return prefs.getString(KEY_SERVER_URL, DEFAULT_SERVER_URL);
+    }
+
+    private boolean getAutoPlayAudio() {
+        if (prefs == null) {
+            prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        }
+        return prefs.getBoolean(KEY_AUTO_PLAY_AUDIO, true);
+    }
+
+    private void updateSessionIdDisplay() {
+        if (sessionId != null && sessionId.length() >= 8) {
+            tvSessionId.setText("SID: " + sessionId.substring(0, 8));
+        }
+    }
+
+    private void updateEngineDisplay() {
+        if (tvEngine != null) {
+            tvEngine.setText(useVosk ? "引擎: Vosk离线" : "引擎: 在线识别");
+        }
+    }
+
+    private void setupListeners() {
+        btnSpeak.setOnTouchListener((v, event) -> {
+            switch (event.getAction()) {
+                case android.view.MotionEvent.ACTION_DOWN:
+                    startRecordingAndRecognize();
+                    break;
+                case android.view.MotionEvent.ACTION_UP:
+                case android.view.MotionEvent.ACTION_CANCEL:
+                    stopRecording();
+                    break;
+            }
+            return true;
+        });
+
+        if (btnMode != null) {
+            btnMode.setOnClickListener(v -> {
+                useVosk = !useVosk;
+                prefs.edit().putBoolean(KEY_USE_VOSK, useVosk).apply();
+                updateEngineDisplay();
+                showToast(useVosk ? "已切换到 Vosk 离线识别" : "已切换到在线识别");
+            });
+        }
+
+        btnSettings.setOnClickListener(v -> {
+            startActivity(new Intent(this, SettingsActivity.class));
+        });
+
+        btnAttach.setOnClickListener(v -> openGallery());
+        btnCamera.setOnClickListener(v -> openCamera());
+    }
+
+    // ==================== Vosk 初始化 ====================
+
+    private void initVosk() {
+        voskManager = new VoskManager(this);
+        updateStatus("正在加载离线模型...");
+
+        voskManager.initModel(new VoskManager.InitCallback() {
+            @Override
+            public void onSuccess() {
+                mainHandler.post(() -> {
+                    updateStatus("就绪（Vosk离线）");
+                    btnSpeak.setEnabled(true);
+                });
+            }
+
+            @Override
+            public void onFailure(String error) {
+                mainHandler.post(() -> {
+                    updateStatus("模型加载失败: " + error + "，使用在线识别");
+                    btnSpeak.setEnabled(true);
+                    useVosk = false;
+                    updateEngineDisplay();
+                });
+            }
+        });
+    }
+
+    // ==================== 权限检查 ====================
+
+    private void checkPermissions() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.RECORD_AUDIO},
+                    REQ_RECORD_AUDIO);
+        } else {
+            checkSttAvailability();
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions,
+                                           @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQ_RECORD_AUDIO) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                checkSttAvailability();
+            } else {
+                showError("需要麦克风权限才能使用语音功能");
+            }
+        } else if (requestCode == REQ_PERMISSIONS_MEDIA) {
+            // 媒体权限结果，在 onActivityResult 中处理
+        } else if (requestCode == REQ_PERMISSIONS_CAMERA) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                launchCamera();
+            } else {
+                showError("需要相机权限才能拍照");
+            }
+        }
+    }
+
+    private void checkSttAvailability() {
+        if (useVosk && voskManager != null && voskManager.isModelLoaded()) {
+            startRecordingAndRecognize();
+            return;
+        }
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            showError("设备不支持语音识别");
+            return;
+        }
+        startRecordingAndRecognize();
+    }
+
+    // ==================== 录音 + STT ====================
+
+    private void startRecordingAndRecognize() {
+        if (isRecording || isRecognizing) return;
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            checkPermissions();
+            return;
+        }
+
+        if (!useVosk && !isNetworkAvailable()) {
+            showError("无网络连接，请检查网络");
+            return;
+        }
+
+        if (useVosk && voskManager != null && voskManager.isModelLoaded()) {
+            startWavRecording();
+        } else {
+            startMediaRecording();
+            startSpeechRecognition();
+        }
+
+        recordTimeoutRunnable = () -> {
+            if (isRecording) {
+                runOnUiThread(() -> {
+                    stopRecording();
+                    showError("录音超时（10秒）");
+                });
+            }
+        };
+        mainHandler.postDelayed(recordTimeoutRunnable, MAX_RECORD_SECONDS * 1000L);
+    }
+
+    // ==================== Vosk 录音（WAV） ====================
+
+    private void startWavRecording() {
+        try {
+            File audioDir = getCacheDir();
+            currentWavFile = new File(audioDir, "temp_audio.wav").getAbsolutePath();
+
+            wavRecorder = new WavAudioRecorder();
+            wavRecorder.setCallback(new WavAudioRecorder.RecordingCallback() {
+                @Override
+                public void onRecordingStarted() {
+                    isRecording = true;
+                    runOnUiThread(() -> {
+                        updateStatus("正在录音...");
+                        btnSpeak.setText("录音中...");
+                    });
+                    Log.d(TAG, "WAV 录音已开始: " + currentWavFile);
+                }
+
+                @Override
+                public void onRecordingStopped(String filePath) {
+                    isRecording = false;
+                    Log.d(TAG, "WAV 录音已停止: " + filePath);
+                    runOnUiThread(() -> {
+                        updateStatus("正在识别...");
+                        recognizeWithVosk(filePath);
+                    });
+                }
+
+                @Override
+                public void onError(String error) {
+                    isRecording = false;
+                    Log.e(TAG, "WAV 录音错误: " + error);
+                    runOnUiThread(() -> showError("录音失败: " + error));
+                }
+            });
+
+            wavRecorder.startRecording(currentWavFile);
+
+        } catch (Exception e) {
+            Log.e(TAG, "WAV 录音启动失败", e);
+            showError("录音启动失败: " + e.getMessage());
+        }
+    }
+
+    private void recognizeWithVosk(String wavFilePath) {
+        isRecognizing = true;
+
+        voskManager.recognizeFile(wavFilePath, new VoskManager.RecognizeCallback() {
+            @Override
+            public void onResult(String text) {
+                isRecognizing = false;
+                Log.d(TAG, "Vosk 识别结果: " + text);
+                onSttResult(text);
+            }
+
+            @Override
+            public void onError(String error) {
+                isRecognizing = false;
+                Log.e(TAG, "Vosk 识别错误: " + error);
+                runOnUiThread(() -> {
+                    if (isNetworkAvailable() && SpeechRecognizer.isRecognitionAvailable(MainActivity.this)) {
+                        showToast("离线识别失败，尝试在线识别...");
+                        useOnlineRecognitionFallback();
+                    } else {
+                        showError("识别失败: " + error);
+                        btnSpeak.setText("按住说话");
+                        updateStatus("就绪");
+                    }
+                });
+            }
+        });
+    }
+
+    private void useOnlineRecognitionFallback() {
+        useVosk = false;
+        updateEngineDisplay();
+        showError("离线识别失败，请长按按钮重试（将使用在线识别）");
+        btnSpeak.setText("按住说话");
+        updateStatus("就绪");
+    }
+
+    // ==================== MediaRecorder + SpeechRecognizer ====================
+
+    private void startMediaRecording() {
+        try {
+            File audioDir = getCacheDir();
+            currentAudioFile = new File(audioDir, "temp_audio.m4a").getAbsolutePath();
+
+            mediaRecorder = new MediaRecorder();
+            mediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
+            mediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+            mediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+            mediaRecorder.setAudioEncodingBitRate(128000);
+            mediaRecorder.setAudioSamplingRate(44100);
+            mediaRecorder.setOutputFile(currentAudioFile);
+
+            mediaRecorder.prepare();
+            mediaRecorder.start();
+
+            isRecording = true;
+            updateStatus("正在录音...");
+            btnSpeak.setText("录音中...");
+
+            Log.d(TAG, "MediaRecorder started: " + currentAudioFile);
+
+        } catch (IOException | IllegalStateException e) {
+            Log.e(TAG, "MediaRecorder start failed", e);
+            showError("录音启动失败: " + e.getMessage());
+            cleanupMediaRecorder();
+        }
+    }
+
+    private void stopRecording() {
+        if (recordTimeoutRunnable != null) {
+            mainHandler.removeCallbacks(recordTimeoutRunnable);
+            recordTimeoutRunnable = null;
+        }
+
+        if (!isRecording) return;
+
+        if (useVosk && voskManager != null && voskManager.isModelLoaded() && wavRecorder != null) {
+            wavRecorder.stopRecording();
+            wavRecorder = null;
+            isRecording = false;
+            return;
+        }
+
+        try {
+            mediaRecorder.stop();
+            Log.d(TAG, "MediaRecorder stopped");
+        } catch (IllegalStateException e) {
+            Log.e(TAG, "MediaRecorder stop failed", e);
+        }
+
+        cleanupMediaRecorder();
+        isRecording = false;
+
+        if (!isRecognizing) {
+            updateStatus("正在识别...");
+        }
+    }
+
+    private void cleanupMediaRecorder() {
+        if (mediaRecorder != null) {
+            try {
+                mediaRecorder.release();
+            } catch (Exception ignored) {}
+            mediaRecorder = null;
+        }
+    }
+
+    private void startSpeechRecognition() {
+        try {
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
+            speechRecognizer.setRecognitionListener(new RecognitionListener() {
+                @Override
+                public void onReadyForSpeech(Bundle params) {
+                    isRecognizing = true;
+                    updateStatus("正在听...");
+                }
+
+                @Override
+                public void onBeginningOfSpeech() {}
+
+                @Override
+                public void onRmsChanged(float rmsdB) {}
+
+                @Override
+                public void onBufferReceived(byte[] buffer) {}
+
+                @Override
+                public void onEndOfSpeech() {
+                    updateStatus("识别中...");
+                }
+
+                @Override
+                public void onError(int error) {
+                    isRecognizing = false;
+                    Log.e(TAG, "STT error: " + error);
+                    if (error == SpeechRecognizer.ERROR_NO_MATCH ||
+                            error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                        onSttResult("");
+                    } else {
+                        String msg = getSttErrorMessage(error);
+                        showError("识别失败: " + msg);
+                    }
+                }
+
+                @Override
+                public void onResults(Bundle results) {
+                    isRecognizing = false;
+                    var matches = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                    if (matches != null && !matches.isEmpty()) {
+                        String text = matches.get(0);
+                        Log.d(TAG, "STT result: " + text);
+                        onSttResult(text);
+                    } else {
+                        onSttResult("");
+                    }
+                }
+
+                @Override
+                public void onPartialResults(Bundle partialResults) {
+                    var matches = partialResults.getStringArrayList(
+                            SpeechRecognizer.RESULTS_RECOGNITION);
+                    if (matches != null && !matches.isEmpty()) {
+                        Log.d(TAG, "STT partial: " + matches.get(0));
+                    }
+                }
+
+                @Override
+                public void onEvent(int eventType, Bundle params) {}
+            });
+
+            Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+            intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                    RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+            intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault());
+            intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+            intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
+
+            speechRecognizer.startListening(intent);
+
+        } catch (Exception e) {
+            Log.e(TAG, "SpeechRecognizer start failed", e);
+            isRecognizing = false;
+            showError("语音识别启动失败: " + e.getMessage());
+        }
+    }
+
+    private String getSttErrorMessage(int error) {
+        switch (error) {
+            case SpeechRecognizer.ERROR_AUDIO: return "音频录制错误";
+            case SpeechRecognizer.ERROR_CLIENT: return "客户端错误";
+            case SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS: return "权限不足";
+            case SpeechRecognizer.ERROR_NETWORK: return "网络错误";
+            case SpeechRecognizer.ERROR_NETWORK_TIMEOUT: return "网络超时";
+            case SpeechRecognizer.ERROR_NO_MATCH: return "没有匹配结果";
+            case SpeechRecognizer.ERROR_RECOGNIZER_BUSY: return "识别服务忙碌";
+            case SpeechRecognizer.ERROR_SERVER: return "服务器错误";
+            case SpeechRecognizer.ERROR_SPEECH_TIMEOUT: return "没有语音输入";
+            default: return "未知错误(" + error + ")";
+        }
+    }
+
+    private void onSttResult(String text) {
+        if (text == null) text = "";
+        text = text.trim();
+        final String finalText = text;
+
+        if (finalText.isEmpty()) {
+            runOnUiThread(() -> {
+                updateStatus("未识别到内容，请重试");
+                btnSpeak.setText("按住说话");
+            });
+            return;
+        }
+
+        runOnUiThread(() -> {
+            appendUserText(finalText);
+            updateStatus("发送中...");
+        });
+
+        sendToServer(finalText, null, null, null);
+    }
+
+    // ==================== 媒体选择 ====================
+
+    private void openGallery() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
+                "image/jpeg", "image/png", "image/gif", "image/webp",
+                "audio/mpeg", "audio/mp3", "audio/wav", "audio/ogg", "audio/*",
+                "*/*"
+        });
+        intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, false);
+        // Android 13+ 需要 persistable 权限才能跨进程访问文件
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        galleryLauncher.launch(Intent.createChooser(intent, "选择媒体"));
+    }
+
+    private void openCamera() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.CAMERA},
+                    REQ_PERMISSIONS_CAMERA);
+            return;
+        }
+        launchCamera();
+    }
+
+    private void launchCamera() {
+        Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
+        if (intent.resolveActivity(getPackageManager()) != null) {
+            File photoFile = null;
+            try {
+                File cacheDir = getCacheDir();
+                @SuppressLint("SimpleDateFormat")
+                String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+                photoFile = new File(cacheDir, "photo_" + timeStamp + ".jpg");
+            } catch (Exception e) {
+                Log.e(TAG, "create photo file failed", e);
+            }
+
+            if (photoFile != null) {
+                pendingCameraUri = FileProvider.getUriForFile(
+                        this, getPackageName() + ".fileprovider", photoFile);
+                intent.putExtra(MediaStore.EXTRA_OUTPUT, pendingCameraUri);
+                cameraLauncher.launch(intent);
+            }
+        } else {
+            showError("没有可用的相机应用");
+        }
+    }
+
+    private void handleGalleryResult(Intent data) {
+        Uri uri = data.getData();
+        if (uri == null) return;
+
+        String mimeType = getContentResolver().getType(uri);
+        if (mimeType == null) mimeType = "*/*";
+
+        if (mimeType.startsWith("image/")) {
+            uploadAndSendMedia(uri, "image", false, false);
+        } else if (mimeType.startsWith("audio/")) {
+            uploadAndSendMedia(uri, "audio", true, false);
+        } else {
+            uploadAndSendMedia(uri, "file", false, true);
+        }
+    }
+
+    // ==================== 文件上传 ====================
+
+    private void uploadAndSendMedia(Uri uri, String type, boolean isAudio, boolean isFile) {
+        updateStatus("正在上传...");
+        btnSpeak.setEnabled(false);
+
+        new Thread(() -> {
+            try {
+                // 复制文件到临时文件
+                File tempFile = copyUriToTempFile(uri, type);
+                if (tempFile == null) {
+                    runOnUiThread(() -> {
+                        updateStatus("就绪");
+                        showError("无法读取文件");
+                        btnSpeak.setEnabled(true);
+                    });
+                    return;
+                }
+
+                // 确定 MIME 类型
+                String mimeType;
+                if ("image".equals(type)) {
+                    mimeType = "image/jpeg";
+                } else if ("audio".equals(type)) {
+                    mimeType = "audio/mpeg";
+                } else {
+                    mimeType = "*/*";
+                }
+
+                RequestBody fileBody = RequestBody.create(tempFile, MediaType.parse(mimeType));
+                RequestBody body = new MultipartBody.Builder()
+                        .setType(MultipartBody.FORM)
+                        .addFormDataPart("file", tempFile.getName(), fileBody)
+                        .addFormDataPart("type", type)
+                        .build();
+
+                String baseUrl = getServerUrl();
+                String uploadUrl = baseUrl + "/api/upload";
+
+                Request request = new Request.Builder()
+                        .url(uploadUrl)
+                        .post(body)
+                        .build();
+
+                httpClient.newCall(request).enqueue(new Callback() {
+                    @Override
+                    public void onFailure(@NonNull Call call, @NonNull IOException e) {
+                        Log.e(TAG, "Upload failed", e);
+                        runOnUiThread(() -> {
+                            updateStatus("上传失败");
+                            showError("上传失败: " + e.getMessage());
+                            btnSpeak.setEnabled(true);
+                        });
+                    }
+
+                    @Override
+                    public void onResponse(@NonNull Call call, @NonNull Response response)
+                            throws IOException {
+                        try {
+                            if (response.isSuccessful()) {
+                                String respBody = response.body() != null ? response.body().string() : "";
+                                Log.d(TAG, "Upload response: " + respBody);
+                                UploadResponse upResp = gson.fromJson(respBody, UploadResponse.class);
+
+                                if (upResp != null && upResp.code == 0 && upResp.fileId != null) {
+                                    String fileId = upResp.fileId;
+                                    String displayUrl = upResp.url;
+
+                                    // 在 UI 显示发送的媒体
+                                    runOnUiThread(() -> {
+                                        if ("image".equals(type)) {
+                                            appendSentImage(uri);
+                                        } else if ("audio".equals(type)) {
+                                            appendSentAudio(uri, displayUrl);
+                                        } else {
+                                            appendSentFile(tempFile.getName(), tempFile.length(), displayUrl);
+                                        }
+                                    });
+
+                                    // 发送到服务器
+                                    String baseUrl2 = getServerUrl();
+                                    String chatUrl = baseUrl2 + "/api/chat";
+                                    Map<String, String> chatBody = new HashMap<>();
+                                    chatBody.put("text", "[发送了媒体文件]");
+                                    chatBody.put("sessionId", sessionId);
+                                    chatBody.put("fileId", fileId);
+                                    chatBody.put("fileType", type);
+
+                                    String json = gson.toJson(chatBody);
+                                    RequestBody reqBody = RequestBody.create(json,
+                                            MediaType.parse("application/json; charset=utf-8"));
+
+                                    Request chatReq = new Request.Builder()
+                                            .url(chatUrl)
+                                            .post(reqBody)
+                                            .build();
+
+                                    httpClient.newCall(chatReq).enqueue(new Callback() {
+                                        @Override
+                                        public void onFailure(@NonNull Call c, @NonNull IOException e) {
+                                            Log.e(TAG, "Chat send failed", e);
+                                            runOnUiThread(() -> {
+                                                updateStatus("发送失败");
+                                                btnSpeak.setEnabled(true);
+                                            });
+                                        }
+
+                                        @Override
+                                        public void onResponse(@NonNull Call c, @NonNull Response r)
+                                                throws IOException {
+                                            try {
+                                                if (r.isSuccessful()) {
+                                                    String respStr = r.body() != null ? r.body().string() : "";
+                                                    ApiResponse apiResp = gson.fromJson(respStr, ApiResponse.class);
+                                                    if (apiResp != null && apiResp.code == 0) {
+                                                        if (apiResp.sessionId != null) {
+                                                            sessionId = apiResp.sessionId;
+                                                            prefs.edit().putString(KEY_SESSION_ID, sessionId).apply();
+                                                            runOnUiThread(() -> updateSessionIdDisplay());
+                                                        }
+                                                        final String reply = apiResp.reply != null ? apiResp.reply : "";
+                                                        final String audioUrl = apiResp.audioUrl;
+                                                        runOnUiThread(() -> {
+                                                            if (!reply.isEmpty()) {
+                                                                appendAssistantText(reply);
+                                                            }
+                                                            updateStatus("就绪");
+                                                            btnSpeak.setEnabled(true);
+                                                            // TTS 播放
+                                                            if (audioUrl != null && getAutoPlayAudio()) {
+                                                                playTtsAudio(audioUrl);
+                                                            }
+                                                        });
+                                                    }
+                                                }
+                                            } finally {
+                                                r.close();
+                                            }
+                                        }
+                                    });
+
+                                } else {
+                                    runOnUiThread(() -> {
+                                        updateStatus("上传响应解析失败");
+                                        btnSpeak.setEnabled(true);
+                                    });
+                                }
+                            } else {
+                                runOnUiThread(() -> {
+                                    updateStatus("上传失败: HTTP " + response.code());
+                                    btnSpeak.setEnabled(true);
+                                });
+                            }
+                        } finally {
+                            response.close();
+                        }
+                    }
+                });
+
+            } catch (Exception e) {
+                Log.e(TAG, "Upload error", e);
+                runOnUiThread(() -> {
+                    updateStatus("上传出错");
+                    showError("上传出错: " + e.getMessage());
+                    btnSpeak.setEnabled(true);
+                });
+            }
+        }).start();
+    }
+
+    private File copyUriToTempFile(Uri uri, String type) {
+        FileOutputStream fos = null;
+        InputStream is = null;
+        File tempFile = null;
+        try {
+            File cacheDir = getCacheDir();
+            String suffix;
+            if ("image".equals(type)) {
+                suffix = ".jpg";
+            } else if ("audio".equals(type)) {
+                suffix = ".mp3";
+            } else {
+                suffix = ".bin";
+            }
+            tempFile = new File(cacheDir, "upload_" + System.currentTimeMillis() + suffix);
+
+            ContentResolver resolver = getContentResolver();
+            is = resolver.openInputStream(uri);
+            if (is == null) return null;
+
+            fos = new FileOutputStream(tempFile);
+            byte[] buffer = new byte[8192];
+            int len;
+            while ((len = is.read(buffer)) != -1) {
+                fos.write(buffer, 0, len);
+            }
+            fos.flush();
+            return tempFile;
+        } catch (Exception e) {
+            Log.e(TAG, "copyUriToTempFile failed", e);
+            if (tempFile != null) tempFile.delete();
+            return null;
+        } finally {
+            try { if (fos != null) fos.close(); } catch (Exception ignored) {}
+            try { if (is != null) is.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    // ==================== HTTP 发送 ====================
+
+    private void sendToServer(String text, String fileId, String fileType) {
+        sendToServer(text, fileId, fileType, null);
+    }
+
+    private void sendToServer(String text, String fileId, String fileType, String extraText) {
+        if (!isNetworkAvailable()) {
+            runOnUiThread(() -> {
+                updateStatus("无网络");
+                appendAssistantText("[网络不可用]");
+                btnSpeak.setText("按住说话");
+            });
+            return;
+        }
+
+        Map<String, String> body = new HashMap<>();
+        body.put("text", text);
+        body.put("sessionId", sessionId);
+        if (fileId != null) body.put("fileId", fileId);
+        if (fileType != null) body.put("fileType", fileType);
+
+        String json = gson.toJson(body);
+        RequestBody requestBody = RequestBody.create(json,
+                MediaType.parse("application/json; charset=utf-8"));
+
+        String url = getServerUrl() + "/api/chat";
+        Request request = new Request.Builder()
+                .url(url)
+                .post(requestBody)
+                .build();
+
+        httpClient.newCall(request).enqueue(new Callback() {
+            @Override
+            public void onFailure(@NonNull Call call, @NonNull IOException e) {
+                Log.e(TAG, "HTTP request failed", e);
+                runOnUiThread(() -> {
+                    updateStatus("请求失败");
+                    appendAssistantText("[请求失败: " + e.getMessage() + "]");
+                    btnSpeak.setText("按住说话");
+                });
+            }
+
+            @Override
+            public void onResponse(@NonNull Call call, @NonNull Response response)
+                    throws IOException {
+                try {
+                    if (response.isSuccessful()) {
+                        String respBody = response.body() != null ? response.body().string() : "";
+                        Log.d(TAG, "Response: " + respBody);
+                        ApiResponse apiResp = gson.fromJson(respBody, ApiResponse.class);
+
+                        if (apiResp != null && apiResp.code == 0) {
+                            if (apiResp.sessionId != null && !apiResp.sessionId.isEmpty()) {
+                                sessionId = apiResp.sessionId;
+                                prefs.edit().putString(KEY_SESSION_ID, sessionId).apply();
+                                runOnUiThread(() -> updateSessionIdDisplay());
+                            }
+
+                            String reply = apiResp.reply != null ? apiResp.reply : "[无回复]";
+                            String audioUrl = apiResp.audioUrl;
+
+                            runOnUiThread(() -> {
+                                appendAssistantText(reply);
+                                updateStatus("就绪");
+                                btnSpeak.setText("按住说话");
+
+                                // TTS 自动播放
+                                if (audioUrl != null && getAutoPlayAudio()) {
+                                    playTtsAudio(audioUrl);
+                                }
+
+                                // 显示收到的媒体
+                                if (apiResp.imageUrls != null) {
+                                    for (String imgUrl : apiResp.imageUrls) {
+                                        appendReceivedImage(imgUrl);
+                                    }
+                                }
+                                if (apiResp.audioUrl != null && !getAutoPlayAudio()) {
+                                    // 未开启自动播放时显示播放按钮
+                                    appendReceivedAudio(apiResp.audioUrl);
+                                }
+                                if (apiResp.fileUrl != null) {
+                                    appendReceivedFile(apiResp.fileName, apiResp.fileSize, apiResp.fileUrl);
+                                }
+                            });
+                        } else {
+                            int code = apiResp != null ? apiResp.code : -1;
+                            runOnUiThread(() -> {
+                                updateStatus("服务器错误: " + code);
+                                appendAssistantText("[服务器返回错误: " + code + "]");
+                                btnSpeak.setText("按住说话");
+                            });
+                        }
+                    } else {
+                        runOnUiThread(() -> {
+                            updateStatus("HTTP错误: " + response.code());
+                            appendAssistantText("[HTTP错误: " + response.code() + "]");
+                            btnSpeak.setText("按住说话");
+                        });
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "Parse response failed", e);
+                    runOnUiThread(() -> {
+                        updateStatus("解析响应失败");
+                        appendAssistantText("[解析响应失败]");
+                        btnSpeak.setText("按住说话");
+                    });
+                } finally {
+                    response.close();
+                }
+            }
+        });
+    }
+
+    // ==================== TTS 播放 ====================
+
+    private void playTtsAudio(String audioPath) {
+        if (audioPath == null || audioPath.isEmpty()) return;
+
+        String baseUrl = getServerUrl();
+        String fullUrl;
+        if (audioPath.startsWith("http")) {
+            fullUrl = audioPath;
+        } else {
+            // 拼接完整 URL，确保 baseUrl 没有末尾斜杠
+            String base = baseUrl;
+            if (base.endsWith("/")) {
+                base = base.substring(0, base.length() - 1);
+            }
+            String path = audioPath.startsWith("/") ? audioPath : "/" + audioPath;
+            fullUrl = base + path;
+        }
+
+        Log.d(TAG, "TTS 播放 URL: " + fullUrl);
+
+        // 提取 fileId 用于判断是否正在播放
+        String fileId = audioPath;
+        int lastSlash = audioPath.lastIndexOf('/');
+        if (lastSlash >= 0) {
+            fileId = audioPath.substring(lastSlash + 1);
+        }
+        if (fileId.isEmpty()) fileId = audioPath;
+
+        if (fileId.equals(currentlyPlayingAudioId) && mediaPlayer != null) {
+            // 已经在播放这首歌，暂停
+            try {
+                if (mediaPlayer.isPlaying()) {
+                    mediaPlayer.pause();
+                } else {
+                    mediaPlayer.start();
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "toggle pause failed", e);
+            }
+            currentlyPlayingAudioId = null;
+            return;
+        }
+
+        stopCurrentPlayback();
+
+        updateStatus("正在播放音频...");
+        mediaPlayer = new MediaPlayer();
+        currentlyPlayingAudioId = fileId;
+
+        try {
+            mediaPlayer.setDataSource(fullUrl);
+            mediaPlayer.setAudioStreamType(android.media.AudioManager.STREAM_MUSIC);
+            mediaPlayer.setOnPreparedListener(mp -> {
+                mp.start();
+                runOnUiThread(() -> updateStatus("播放中..."));
+            });
+            mediaPlayer.setOnCompletionListener(mp -> {
+                currentlyPlayingAudioId = null;
+                runOnUiThread(() -> updateStatus("就绪"));
+            });
+            mediaPlayer.setOnErrorListener((mp, what, extra) -> {
+                Log.e(TAG, "MediaPlayer error: what=" + what + ", extra=" + extra);
+                currentlyPlayingAudioId = null;
+                runOnUiThread(() -> updateStatus("播放失败"));
+                return true;
+            });
+            mediaPlayer.prepareAsync();
+        } catch (Exception e) {
+            Log.e(TAG, "MediaPlayer error", e);
+            currentlyPlayingAudioId = null;
+            runOnUiThread(() -> updateStatus("播放失败"));
+        }
+    }
+
+    private void stopCurrentPlayback() {
+        if (mediaPlayer != null) {
+            try {
+                if (mediaPlayer.isPlaying()) {
+                    mediaPlayer.stop();
+                }
+                mediaPlayer.release();
+            } catch (Exception ignored) {}
+            mediaPlayer = null;
+            currentlyPlayingAudioId = null;
+        }
+    }
+
+    // ==================== UI 辅助 ====================
+
+    private void appendUserText(String text) {
+        if (llChat == null) return;
+        TextView tv = new TextView(this);
+        tv.setText("👤 " + text);
+        tv.setTextColor(0xFF00D9FF);
+        tv.setTextSize(16);
+        tv.setPadding(8, 8, 8, 8);
+        llChat.addView(tv);
+        scrollToBottom();
+    }
+
+    private void appendAssistantText(String text) {
+        if (llChat == null) return;
+        TextView tv = new TextView(this);
+        tv.setText("🤖 " + text);
+        tv.setTextColor(0xFFFFD93D);
+        tv.setTextSize(16);
+        tv.setPadding(8, 8, 8, 8);
+        llChat.addView(tv);
+        scrollToBottom();
+    }
+
+    // 显示发送的图片
+    private void appendSentImage(Uri localUri) {
+        if (llChat == null) return;
+        ImageView iv = new ImageView(this);
+        int size = (int) (200 * getResources().getDisplayMetrics().density);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(size, size);
+        lp.bottomMargin = 8;
+        iv.setLayoutParams(lp);
+        iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        iv.setBackgroundColor(0xFF333355);
+        llChat.addView(iv);
+
+        try {
+            InputStream is = getContentResolver().openInputStream(localUri);
+            Bitmap bmp = BitmapFactory.decodeStream(is);
+            if (bmp != null) iv.setImageBitmap(bmp);
+            is.close();
+        } catch (Exception e) {
+            Log.e(TAG, "display sent image failed", e);
+        }
+        scrollToBottom();
+    }
+
+    // 显示发送的音频
+    private void appendSentAudio(Uri localUri, String displayUrl) {
+        if (llChat == null) return;
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(8, 8, 8, 8);
+
+        TextView label = new TextView(this);
+        label.setText("🎤 已发送音频");
+        label.setTextColor(0xFF00D9FF);
+        label.setTextSize(14);
+
+        ImageButton playBtn = new ImageButton(this);
+        playBtn.setImageResource(android.R.drawable.ic_media_play);
+        playBtn.setBackgroundColor(0x00000000);
+        playBtn.setOnClickListener(v -> {
+            try {
+                MediaPlayer mp = new MediaPlayer();
+                mp.setDataSource(this, localUri);
+                mp.prepare();
+                mp.start();
+                mp.setOnCompletionListener(MediaPlayer::release);
+            } catch (Exception e) {
+                Log.e(TAG, "play local audio failed", e);
+            }
+        });
+
+        row.addView(label);
+        row.addView(playBtn);
+        llChat.addView(row);
+        scrollToBottom();
+    }
+
+    // 显示发送的文件
+    private void appendSentFile(String fileName, long fileSize, String displayUrl) {
+        if (llChat == null) return;
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(8, 8, 8, 8);
+
+        TextView label = new TextView(this);
+        label.setText("📄 " + fileName + " (" + formatFileSize(fileSize) + ")");
+        label.setTextColor(0xFF00D9FF);
+        label.setTextSize(14);
+
+        row.addView(label);
+        llChat.addView(row);
+        scrollToBottom();
+    }
+
+    // 显示接收的图片
+    private void appendReceivedImage(String imagePath) {
+        if (llChat == null) return;
+        // imagePath: /api/download/<fileId>
+        String baseUrl = getServerUrl();
+        String fullUrl;
+        if (imagePath.startsWith("http")) {
+            fullUrl = imagePath;
+        } else {
+            fullUrl = baseUrl + imagePath;
+        }
+
+        ImageView iv = new ImageView(this);
+        int size = (int) (200 * getResources().getDisplayMetrics().density);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(size, size);
+        lp.bottomMargin = 8;
+        iv.setLayoutParams(lp);
+        iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        iv.setBackgroundColor(0xFF333355);
+        llChat.addView(iv);
+
+        // 异步加载图片
+        new Thread(() -> {
+            try {
+                OkHttpClient picClient = new OkHttpClient();
+                Request req = new Request.Builder().url(fullUrl).build();
+                Response resp = picClient.newCall(req).execute();
+                if (resp.isSuccessful()) {
+                    byte[] bytes = resp.body() != null ? resp.body().bytes() : null;
+                    if (bytes != null) {
+                        Bitmap bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+                        runOnUiThread(() -> {
+                            if (bmp != null) iv.setImageBitmap(bmp);
+                        });
+                    }
+                }
+                resp.close();
+            } catch (Exception e) {
+                Log.e(TAG, "load image failed", e);
+            }
+        }).start();
+
+        scrollToBottom();
+    }
+
+    // 显示接收的音频（TTS 播放按钮）
+    private void appendReceivedAudio(String audioPath) {
+        if (llChat == null) return;
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(8, 8, 8, 8);
+
+        TextView label = new TextView(this);
+        label.setText("🔊 TTS 音频");
+        label.setTextColor(0xFFFFD93D);
+        label.setTextSize(14);
+
+        ImageButton playBtn = new ImageButton(this);
+        playBtn.setImageResource(android.R.drawable.ic_media_play);
+        playBtn.setBackgroundColor(0x00000000);
+        playBtn.setOnClickListener(v -> playTtsAudio(audioPath));
+
+        row.addView(label);
+        row.addView(playBtn);
+        llChat.addView(row);
+        scrollToBottom();
+    }
+
+    // 显示接收的文件
+    private void appendReceivedFile(String fileName, Long fileSize, String fileUrl) {
+        if (llChat == null) return;
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(8, 8, 8, 8);
+
+        TextView label = new TextView(this);
+        String sizeStr = fileSize != null ? " (" + formatFileSize(fileSize) + ")" : "";
+        label.setText("📥 " + (fileName != null ? fileName : "文件") + sizeStr);
+        label.setTextColor(0xFFFFD93D);
+        label.setTextSize(14);
+
+        row.addView(label);
+        llChat.addView(row);
+        scrollToBottom();
+    }
+
+    private String formatFileSize(long size) {
+        if (size < 1024) return size + " B";
+        if (size < 1024 * 1024) return String.format("%.1f KB", size / 1024.0);
+        return String.format("%.1f MB", size / (1024.0 * 1024.0));
+    }
+
+    private void scrollToBottom() {
+        mainHandler.postDelayed(() -> {
+            if (scrollView != null) {
+                scrollView.fullScroll(View.FOCUS_DOWN);
+            }
+        }, 100);
+    }
+
+    private void updateStatus(String status) {
+        if (tvStatus != null) {
+            tvStatus.setText(status);
+        }
+    }
+
+    private void showError(String msg) {
+        Log.e(TAG, "Error: " + msg);
+        if (btnSpeak != null) {
+            btnSpeak.setText("按住说话");
+        }
+        updateStatus("就绪");
+        mainHandler.post(() -> {
+            try {
+                if (!isFinishing()) {
+                    new AlertDialog.Builder(this)
+                            .setTitle("提示")
+                            .setMessage(msg)
+                            .setPositiveButton("确定", null)
+                            .show();
+                }
+            } catch (Exception ignored) {}
+        });
+    }
+
+    private void showToast(String msg) {
+        mainHandler.post(() -> {
+            try {
+                new AlertDialog.Builder(this)
+                        .setMessage(msg)
+                        .setPositiveButton("确定", null)
+                        .show();
+            } catch (Exception ignored) {}
+        });
+    }
+
+    private boolean isNetworkAvailable() {
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+        if (cm != null) {
+            NetworkInfo info = cm.getActiveNetworkInfo();
+            return info != null && info.isConnected();
+        }
+        return false;
+    }
+
+    // ==================== 生命周期 ====================
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (recordTimeoutRunnable != null) {
+            mainHandler.removeCallbacks(recordTimeoutRunnable);
+        }
+        cleanupMediaRecorder();
+        if (wavRecorder != null) {
+            wavRecorder.release();
+            wavRecorder = null;
+        }
+        if (speechRecognizer != null) {
+            try {
+                speechRecognizer.destroy();
+            } catch (Exception ignored) {}
+            speechRecognizer = null;
+        }
+        if (voskManager != null) {
+            voskManager.shutdown();
+        }
+        stopCurrentPlayback();
+    }
+
+    // ==================== API 响应模型 ====================
+
+    static class ApiResponse {
+        int code;
+        String reply;
+        String sessionId;
+        String audioUrl;
+        String[] imageUrls;
+        String fileUrl;
+        String fileName;
+        Long fileSize;
+    }
+
+    static class UploadResponse {
+        int code;
+        String url;
+        String fileId;
+    }
+}

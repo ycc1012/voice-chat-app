@@ -1,0 +1,178 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#1A1A2E"
+    android:padding="16dp">
+
+    <!-- 状态栏 -->
+    <TextView
+        android:id="@+id/tvStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="就绪"
+        android:textColor="#888888"
+        android:textSize="14sp"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <TextView
+        android:id="@+id/tvSessionId"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text=""
+        android:textColor="#555555"
+        android:textSize="12sp"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <!-- 引擎状态 -->
+    <TextView
+        android:id="@+id/tvEngine"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="引擎: Vosk离线"
+        android:textColor="#00D9FF"
+        android:textSize="12sp"
+        android:layout_marginTop="4dp"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/tvStatus" />
+
+    <Button
+        android:id="@+id/btnMode"
+        android:layout_width="wrap_content"
+        android:layout_height="32dp"
+        android:text="切换引擎"
+        android:textSize="11sp"
+        android:paddingStart="8dp"
+        android:paddingEnd="8dp"
+        android:backgroundTint="#333355"
+        android:textColor="#AAAAAA"
+        app:layout_constraintEnd_toStartOf="@+id/btnSettings"
+        app:layout_constraintTop_toBottomOf="@+id/tvSessionId" />
+
+    <Button
+        android:id="@+id/btnSettings"
+        android:layout_width="wrap_content"
+        android:layout_height="32dp"
+        android:text="设置"
+        android:textSize="11sp"
+        android:paddingStart="8dp"
+        android:paddingEnd="8dp"
+        android:backgroundTint="#333355"
+        android:textColor="#AAAAAA"
+        android:layout_marginStart="4dp"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/tvSessionId" />
+
+    <!-- 对话区域 -->
+    <ScrollView
+        android:id="@+id/scrollView"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_marginTop="16dp"
+        android:layout_marginBottom="8dp"
+        android:background="#16213E"
+        android:padding="12dp"
+        app:layout_constraintBottom_toTopOf="@+id/llMediaButtons"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/tvEngine">
+
+        <LinearLayout
+            android:id="@+id/llChat"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <!-- 动态添加对话内容 -->
+
+        </LinearLayout>
+
+    </ScrollView>
+
+    <!-- 媒体按钮行 -->
+    <LinearLayout
+        android:id="@+id/llMediaButtons"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center"
+        android:layout_marginBottom="8dp"
+        app:layout_constraintBottom_toTopOf="@+id/llConfirmButtons"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent">
+
+        <ImageButton
+            android:id="@+id/btnAttach"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:text="📎"
+            android:textSize="20sp"
+            android:backgroundTint="#333355"
+            android:padding="0dp"
+            android:gravity="center" />
+
+        <ImageButton
+            android:id="@+id/btnCamera"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:text="📷"
+            android:textSize="20sp"
+            android:backgroundTint="#333355"
+            android:padding="0dp"
+            android:gravity="center"
+            android:layout_marginStart="8dp" />
+
+    </LinearLayout>
+
+    <!-- 录音确认按钮行 -->
+    <LinearLayout
+        android:id="@+id/llConfirmButtons"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:visibility="gone"
+        android:gravity="center"
+        android:layout_marginBottom="8dp"
+        app:layout_constraintBottom_toTopOf="@+id/btnSpeak"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent">
+
+        <Button
+            android:id="@+id/btnConfirmSend"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:text="✓ 发送"
+            android:backgroundTint="#00AA55"
+            android:textColor="#FFFFFF" />
+
+        <Button
+            android:id="@+id/btnConfirmCancel"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:text="✗ 取消"
+            android:backgroundTint="#AA3333"
+            android:textColor="#FFFFFF"
+            android:layout_marginStart="16dp" />
+
+    </LinearLayout>
+
+    <!-- 按住说话按钮 -->
+    <Button
+        android:id="@+id/btnSpeak"
+        android:layout_width="200dp"
+        android:layout_height="200dp"
+        android:layout_marginBottom="32dp"
+        android:background="@drawable/btn_speak_bg"
+        android:gravity="center"
+        android:text="按住说话"
+        android:textColor="#FFFFFF"
+        android:textSize="20sp"
+        android:textStyle="bold"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent" />
+
+</androidx.constraintlayout.widget.ConstraintLayout>

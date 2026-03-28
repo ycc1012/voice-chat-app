@@ -1,0 +1,524 @@
+package com.voicechat;
+
+import android.app.AlertDialog;
+import android.app.ProgressDialog;
+import android.content.DialogInterface;
+import android.os.AsyncTask;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.Log;
+import android.view.View;
+import android.widget.ArrayAdapter;
+import android.widget.Button;
+import android.widget.LinearLayout;
+import android.widget.ProgressBar;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
+import android.widget.TextView;
+import android.widget.Toast;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.content.ContextCompat;
+
+import com.google.gson.Gson;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.lang.ref.WeakReference;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+
+public class ModelManagementActivity extends AppCompatActivity {
+
+    private static final String TAG = "ModelMgmt";
+    public static final String PREFS_NAME = "voicechat_prefs";
+    public static final String KEY_SELECTED_MODEL = "selected_model";
+
+    // 可用模型列表（名称, 下载URL, 模型目录名）
+    private static final ModelInfo[] AVAILABLE_MODELS = {
+        new ModelInfo("vosk-model-cn-0.1", "中文模型 (推荐)", "https://alphacephei.com/vosk/models/vosk-model-cn-0.1.zip", "vosk-model-cn"),
+        new ModelInfo("vosk-model-small-cn-0.3", "中文小模型 (快速)", "https://alphacephei.com/vosk/models/vosk-model-small-cn-0.3.zip", "vosk-model-small-cn"),
+        new ModelInfo("vosk-model-en-us-0.5", "英文模型", "https://alphacephei.com/vosk/models/vosk-model-en-us-0.5.zip", "vosk-model-en-us"),
+        new ModelInfo("vosk-model-en-us-0.21", "英文模型 (新版)", "https://alphacephei.com/vosk/models/vosk-model-en-us-0.21.zip", "vosk-model-en-us-0.21"),
+    };
+
+    private RadioGroup rgModels;
+    private Button btnDownload;
+    private Button btnBack;
+    private Button btnUseSelected;
+    private TextView tvCurrentModel;
+    private TextView tvStatus;
+    private ProgressBar pbDownload;
+    private LinearLayout llProgress;
+
+    private String currentSelectedId;
+    private String currentlyLoadedModelDir;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_model_management);
+
+        initViews();
+        loadCurrentModel();
+        populateModelList();
+        setupListeners();
+    }
+
+    private void initViews() {
+        rgModels = findViewById(R.id.rgModels);
+        btnDownload = findViewById(R.id.btnDownload);
+        btnBack = findViewById(R.id.btnBack);
+        btnUseSelected = findViewById(R.id.btnUseSelected);
+        tvCurrentModel = findViewById(R.id.tvCurrentModel);
+        tvStatus = findViewById(R.id.tvStatus);
+        pbDownload = findViewById(R.id.pbDownload);
+        llProgress = findViewById(R.id.llProgress);
+    }
+
+    private void loadCurrentModel() {
+        var prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        currentlyLoadedModelDir = prefs.getString(KEY_SELECTED_MODEL, "vosk-model-cn");
+        currentSelectedId = currentlyLoadedModelDir;
+        tvCurrentModel.setText("当前模型: " + getModelDisplayName(currentlyLoadedModelDir));
+    }
+
+    private String getModelDisplayName(String modelDir) {
+        for (ModelInfo m : AVAILABLE_MODELS) {
+            if (m.dirName.equals(modelDir)) return m.displayName;
+        }
+        return modelDir;
+    }
+
+    private void populateModelList() {
+        rgModels.removeAllViews();
+        for (ModelInfo model : AVAILABLE_MODELS) {
+            RadioButton rb = new RadioButton(this);
+            rb.setId(View.generateViewId());
+            rb.setText(getModelItemText(model));
+            rb.setTag(model.id);
+            rb.setTextColor(0xFFFFFFFF);
+            rb.setPadding(16, 12, 16, 12);
+
+            // 选中当前使用的模型
+            if (model.dirName.equals(currentlyLoadedModelDir)) {
+                rb.setChecked(true);
+                currentSelectedId = model.id;
+            }
+
+            rgModels.addView(rb);
+        }
+
+        rgModels.setOnCheckedChangeListener((group, checkedId) -> {
+            RadioButton checked = findViewById(checkedId);
+            if (checked != null) {
+                currentSelectedId = (String) checked.getTag();
+                updateButtonStates();
+            }
+        });
+
+        updateButtonStates();
+    }
+
+    private String getModelItemText(ModelInfo model) {
+        File modelDir = getModelDir(model.dirName);
+        if (modelDir.exists() && isModelValid(modelDir)) {
+            return model.displayName + " ✓ (已下载)";
+        }
+        return model.displayName + " (未下载)";
+    }
+
+    private void updateButtonStates() {
+        if (currentSelectedId == null) return;
+
+        ModelInfo selected = getModelById(currentSelectedId);
+        if (selected == null) return;
+
+        File modelDir = getModelDir(selected.dirName);
+        boolean downloaded = modelDir.exists() && isModelValid(modelDir);
+
+        btnUseSelected.setEnabled(downloaded && !selected.dirName.equals(currentlyLoadedModelDir));
+        btnDownload.setEnabled(!downloaded);
+        btnUseSelected.setText(selected.dirName.equals(currentlyLoadedModelDir) ? "当前使用中" : "使用此模型");
+        btnDownload.setText(downloaded ? "已下载" : "下载");
+    }
+
+    private void setupListeners() {
+        btnBack.setOnClickListener(v -> finish());
+
+        btnDownload.setOnClickListener(v -> {
+            if (currentSelectedId == null) return;
+            ModelInfo model = getModelById(currentSelectedId);
+            if (model != null) {
+                confirmAndDownload(model);
+            }
+        });
+
+        btnUseSelected.setOnClickListener(v -> {
+            if (currentSelectedId == null) return;
+            ModelInfo model = getModelById(currentSelectedId);
+            if (model != null) {
+                switchToModel(model);
+            }
+        });
+    }
+
+    private void confirmAndDownload(ModelInfo model) {
+        new AlertDialog.Builder(this)
+                .setTitle("下载模型")
+                .setMessage("确定要下载 \"" + model.displayName + "\" 吗？\n\n大小约 1-2GB，请确保网络连接稳定。")
+                .setPositiveButton("下载", (d, w) -> startDownload(model))
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void switchToModel(ModelInfo model) {
+        // 保存选择
+        var prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        prefs.edit().putString(KEY_SELECTED_MODEL, model.dirName).apply();
+
+        currentlyLoadedModelDir = model.dirName;
+        currentSelectedId = model.id;
+
+        // 重新加载 Vosk 模型
+        Toast.makeText(this, "正在加载模型...", Toast.LENGTH_SHORT).show();
+        tvStatus.setText("正在切换模型...");
+
+        VoskManager newManager = new VoskManager(this);
+        newManager.switchModel(model.dirName, new VoskManager.InitCallback() {
+            @Override
+            public void onSuccess() {
+                mainHandler.post(() -> {
+                    tvCurrentModel.setText("当前模型: " + model.displayName);
+                    tvStatus.setText("模型切换成功");
+                    Toast.makeText(ModelManagementActivity.this, "模型已切换", Toast.LENGTH_SHORT).show();
+                    populateModelList();
+                    // 更新 MainActivity（如果存在的话）
+                    notifyMainActivityModelChanged(model.dirName);
+                });
+            }
+
+            @Override
+            public void onFailure(String error) {
+                mainHandler.post(() -> {
+                    tvStatus.setText("模型切换失败: " + error);
+                    Toast.makeText(ModelManagementActivity.this, "切换失败: " + error, Toast.LENGTH_LONG).show();
+                });
+            }
+        });
+    }
+
+    private void notifyMainActivityModelChanged(String modelDir) {
+        // 通知 MainActivity 模型已切换
+        // 通过 SharedPreferences 广播或静态字段
+        VoskManager.setPendingModelDir(modelDir);
+    }
+
+    private void startDownload(ModelInfo model) {
+        llProgress.setVisibility(View.VISIBLE);
+        pbDownload.setProgress(0);
+        tvStatus.setText("正在下载...");
+        btnDownload.setEnabled(false);
+        btnUseSelected.setEnabled(false);
+
+        new DownloadTask(this, model, new DownloadCallback() {
+            @Override
+            public void onProgress(int percent) {
+                mainHandler.post(() -> {
+                    pbDownload.setProgress(percent);
+                    tvStatus.setText("下载中... " + percent + "%");
+                });
+            }
+
+            @Override
+            public void onSuccess(File extractedDir) {
+                mainHandler.post(() -> {
+                    llProgress.setVisibility(View.GONE);
+                    tvStatus.setText("下载完成！");
+                    Toast.makeText(ModelManagementActivity.this, "下载完成", Toast.LENGTH_SHORT).show();
+                    populateModelList();
+                    updateButtonStates();
+                });
+            }
+
+            @Override
+            public void onError(String error) {
+                mainHandler.post(() -> {
+                    llProgress.setVisibility(View.GONE);
+                    tvStatus.setText("下载失败: " + error);
+                    btnDownload.setEnabled(true);
+                    updateButtonStates();
+                    Toast.makeText(ModelManagementActivity.this, "下载失败: " + error, Toast.LENGTH_LONG).show();
+                });
+            }
+        }).execute(model.downloadUrl, model.dirName);
+    }
+
+    private File getModelDir(String dirName) {
+        return new File(getFilesDir(), dirName);
+    }
+
+    private boolean isModelDirEmpty(File dir) {
+        if (!dir.exists() || !dir.isDirectory()) return true;
+        String[] files = dir.list();
+        return files == null || files.length == 0;
+    }
+
+    private boolean isModelValid(File dir) {
+        if (dir == null || !dir.exists() || !dir.isDirectory()) return false;
+        File amDir = new File(dir, "am");
+        File confDir = new File(dir, "conf");
+        return amDir.exists() && amDir.isDirectory() && confDir.exists();
+    }
+
+    private ModelInfo getModelById(String id) {
+        for (ModelInfo m : AVAILABLE_MODELS) {
+            if (m.id.equals(id)) return m;
+        }
+        return null;
+    }
+
+    // ==================== 下载任务 ====================
+
+    interface DownloadCallback {
+        void onProgress(int percent);
+        void onSuccess(File extractedDir);
+        void onError(String error);
+    }
+
+    static class DownloadTask extends AsyncTask<String, Integer, String> {
+        private final WeakReference<ModelManagementActivity> activityRef;
+        private final ModelInfo model;
+        private final DownloadCallback callback;
+        private File extractedDir;
+
+        DownloadTask(ModelManagementActivity activity, ModelInfo model, DownloadCallback callback) {
+            this.activityRef = new WeakReference<>(activity);
+            this.model = model;
+            this.callback = callback;
+        }
+
+        @Override
+        protected String doInBackground(String... params) {
+            String downloadUrl = params[0];
+            String dirName = params[1];
+
+            ModelManagementActivity activity = activityRef.get();
+            if (activity == null) return "Activity 已关闭";
+
+            extractedDir = activity.getModelDir(dirName);
+
+            // 如果已存在有效模型，跳过下载
+            if (activity.isModelValid(extractedDir)) {
+                return "模型已存在";
+            }
+
+            // 删除旧的不完整下载
+            if (extractedDir.exists()) {
+                deleteDir(extractedDir);
+            }
+            extractedDir.mkdirs();
+
+            try {
+                URL url = new URL(downloadUrl);
+                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn.setConnectTimeout(30000);
+                conn.setReadTimeout(120000);
+                conn.connect();
+
+                int fileLength = conn.getContentLength();
+                if (fileLength <= 0) fileLength = 50 * 1024 * 1024; // 估算 50MB
+
+                try (InputStream in = conn.getInputStream();
+                     FileOutputStream fos = new FileOutputStream(new File(activity.getCacheDir(), "model_download.zip"))) {
+
+                    byte[] buffer = new byte[8192];
+                    long total = 0;
+                    int count;
+                    int lastPercent = 0;
+
+                    while ((count = in.read(buffer)) != -1) {
+                        if (isCancelled()) return "下载取消";
+                        total += count;
+                        fos.write(buffer, 0, count);
+
+                        int percent = (int) ((total * 100) / fileLength);
+                        if (percent != lastPercent) {
+                            lastPercent = percent;
+                            publishProgress(percent);
+                        }
+                    }
+                }
+                conn.disconnect();
+
+                // 解压
+                activity.runOnUiThread(() -> {
+                    if (callback != null) callback.onProgress(100);
+                });
+
+                // 解压到目标目录
+                String zipPath = new File(activity.getCacheDir(), "model_download.zip").getAbsolutePath();
+                String result = unzip(zipPath, extractedDir.getAbsolutePath());
+                if (result != null) return result;
+
+                // 清理 zip
+                new File(activity.getCacheDir(), "model_download.zip").delete();
+
+                // 验证
+                if (!activity.isModelValid(extractedDir)) {
+                    return "模型文件不完整，下载失败";
+                }
+
+                return null; // 成功
+
+            } catch (Exception e) {
+                Log.e(TAG, "Download error", e);
+                return "下载失败: " + e.getMessage();
+            }
+        }
+
+        private String unzip(String zipPath, String destDir) {
+            try {
+                // 先解压到临时目录
+                File tempDir = new File(new File(zipPath).getParent(), "temp_unzip_" + System.currentTimeMillis());
+                tempDir.mkdirs();
+
+                try (ZipInputStream zis = new ZipInputStream(new java.io.FileInputStream(zipPath))) {
+                    ZipEntry entry;
+                    byte[] buffer = new byte[8192];
+
+                    while ((entry = zis.getNextEntry()) != null) {
+                        File newFile = new File(tempDir, entry.getName());
+
+                        // 安全检查：不要解压到临时目录外
+                        String tempDirCanonical = tempDir.getCanonicalPath();
+                        String newFileCanonical = newFile.getCanonicalPath();
+                        if (!newFileCanonical.startsWith(tempDirCanonical)) {
+                            deleteDir(tempDir);
+                            return "非法解压路径";
+                        }
+
+                        if (entry.isDirectory()) {
+                            newFile.mkdirs();
+                        } else {
+                            newFile.getParentFile().mkdirs();
+                            try (FileOutputStream fos = new FileOutputStream(newFile)) {
+                                int len;
+                                while ((len = zis.read(buffer)) > 0) {
+                                    fos.write(buffer, 0, len);
+                                }
+                            }
+                        }
+                        zis.closeEntry();
+                    }
+                }
+
+                // 检测是否需要扁平化：如果tempDir根下只有一个子目录，就把子目录内容提升到destDir
+                File[] tempContents = tempDir.listFiles();
+                if (tempContents != null && tempContents.length == 1 && tempContents[0].isDirectory()) {
+                    File innerDir = tempContents[0];
+                    File[] innerContents = innerDir.listFiles();
+                    if (innerContents != null) {
+                        // 把内层内容移到目标目录
+                        for (File f : innerContents) {
+                            File destFile = new File(destDir, f.getName());
+                            if (f.isDirectory()) {
+                                moveDirectory(f, destFile);
+                            } else {
+                                f.renameTo(destFile);
+                            }
+                        }
+                        // 清理多余的内层目录
+                        deleteDir(innerDir);
+                    }
+                } else {
+                    // 没有嵌套，直接移动所有内容
+                    for (File f : tempContents) {
+                        File destFile = new File(destDir, f.getName());
+                        if (f.isDirectory()) {
+                            moveDirectory(f, destFile);
+                        } else {
+                            f.renameTo(destFile);
+                        }
+                    }
+                }
+
+                deleteDir(tempDir);
+                return null;
+            } catch (Exception e) {
+                Log.e(TAG, "Unzip error", e);
+                return "解压失败: " + e.getMessage();
+            }
+        }
+
+        private void moveDirectory(File src, File dest) {
+            if (!dest.exists()) dest.mkdirs();
+            File[] files = src.listFiles();
+            if (files != null) {
+                for (File f : files) {
+                    File destFile = new File(dest, f.getName());
+                    if (f.isDirectory()) {
+                        moveDirectory(f, destFile);
+                    } else {
+                        f.renameTo(destFile);
+                    }
+                }
+            }
+            src.delete();
+        }
+
+        private void deleteDir(File dir) {
+            if (dir.exists()) {
+                File[] files = dir.listFiles();
+                if (files != null) {
+                    for (File f : files) {
+                        if (f.isDirectory()) deleteDir(f);
+                        else f.delete();
+                    }
+                }
+                dir.delete();
+            }
+        }
+
+        @Override
+        protected void onProgressUpdate(Integer... values) {
+            if (callback != null) {
+                callback.onProgress(values[0]);
+            }
+        }
+
+        @Override
+        protected void onPostExecute(String error) {
+            if (callback != null) {
+                if (error == null) {
+                    callback.onSuccess(extractedDir);
+                } else {
+                    callback.onError(error);
+                }
+            }
+        }
+    }
+
+    // ==================== 模型信息 ====================
+
+    static class ModelInfo {
+        String id;          // 唯一标识
+        String displayName; // 显示名称
+        String downloadUrl; // 下载地址
+        String dirName;     // 模型目录名
+
+        ModelInfo(String id, String displayName, String downloadUrl, String dirName) {
+            this.id = id;
+            this.displayName = displayName;
+            this.downloadUrl = downloadUrl;
+            this.dirName = dirName;
+        }
+    }
+}
